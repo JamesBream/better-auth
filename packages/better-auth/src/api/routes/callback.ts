@@ -1,5 +1,6 @@
 import { createAuthEndpoint } from "@better-auth/core/api";
 import type { OAuth2Tokens } from "@better-auth/core/oauth2";
+import { mergeScopes } from "@better-auth/core/oauth2";
 import { safeJSONParse } from "@better-auth/core/utils/json";
 import * as z from "zod";
 import { getAwaitableValue } from "../../context/helpers";
@@ -204,6 +205,7 @@ export const callbackOAuth = createAuthEndpoint(
 				if (existingAccount.userId.toString() !== link.userId.toString()) {
 					return redirectOnError("account_already_linked_to_different_user");
 				}
+				const mergedScope = mergeScopes(existingAccount.scope, tokens.scopes);
 				const updateData = Object.fromEntries(
 					Object.entries({
 						accessToken: await setTokenUtil(tokens.accessToken, c.context),
@@ -211,7 +213,7 @@ export const callbackOAuth = createAuthEndpoint(
 						idToken: tokens.idToken,
 						accessTokenExpiresAt: tokens.accessTokenExpiresAt,
 						refreshTokenExpiresAt: tokens.refreshTokenExpiresAt,
-						scope: tokens.scopes?.join(","),
+						scope: mergedScope || undefined,
 					}).filter(([_, value]) => value !== undefined),
 				);
 				await c.context.internalAdapter.updateAccount(
