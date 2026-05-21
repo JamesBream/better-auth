@@ -179,6 +179,48 @@ await authClient.signIn.social({
 })
 ```
 
+### Sign In with Apple (Native iOS / macOS) with Revocation
+
+Apple's `ASAuthorizationAppleIDCredential` returns both an `identityToken` and an `authorizationCode`. The identity token alone is enough to sign the user in, but it does **not** give the server a refresh token. Without a refresh token Better Auth cannot call Apple's [`/auth/revoke`](https://developer.apple.com/documentation/signinwithapplerestapi/revoke-tokens) endpoint when the user deletes their account, which leaves the Sign in with Apple link active. Apple's [App Store guidelines](https://developer.apple.com/documentation/technotes/tn3194-handling-account-deletions-and-revoking-tokens-for-sign-in-with-apple) require apps that support account deletion to sever this link, and not doing so causes Apple to silently re-issue credentials for the deleted account on the next sign-in attempt.
+
+Opt into the full native flow by setting `enableNativeAppleSignInRevocation: true` on the Apple provider. When enabled:
+
+* `signIn.social` accepts a top-level `appleAuthorizationCode` field alongside the `idToken`.
+* Better Auth exchanges that code with Apple server-side and persists the resulting `refresh_token` on the user's `account` row (encrypted if `account.encryptOAuthTokens` is enabled).
+* When the user is deleted via `/delete-user`, Better Auth automatically calls Apple's `/auth/revoke` endpoint with the stored refresh token, severing the link.
+
+```ts title="auth.ts"
+export const auth = betterAuth({
+    socialProviders: {
+        apple: {
+            clientId: process.env.APPLE_CLIENT_ID as string,
+            clientSecret: await generateAppleClientSecret(/* ... */),
+            // Bundle ID is REQUIRED for the native code exchange — Apple binds
+            // native authorization codes to the bundle identifier, not the
+            // Services ID used on the web.
+            appBundleIdentifier: process.env.APPLE_APP_BUNDLE_IDENTIFIER as string,
+            enableNativeAppleSignInRevocation: true, // [!code highlight]
+        },
+    },
+})
+```
+
+```ts title="auth-client.ts"
+// Pass both fields returned by ASAuthorizationAppleIDCredential.
+await authClient.signIn.social({
+    provider: "apple",
+    idToken: {
+        token: identityToken, // ASAuthorizationAppleIDCredential.identityToken
+        nonce: nonce,         // The nonce you supplied to the request
+    },
+    appleAuthorizationCode: authorizationCode, // [!code highlight]
+})
+```
+
+<Callout type="warn">
+  `appleAuthorizationCode` is honored only when `enableNativeAppleSignInRevocation` is enabled on the Apple provider. With the flag off it is silently ignored, and no refresh token is stored. The flag is opt-in to keep the default behavior unchanged for existing setups.
+</Callout>
+
 ## Generate Apple Client Secret (JWT)
 
 <GenerateAppleJwt />

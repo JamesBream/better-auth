@@ -2,6 +2,7 @@ import type { BetterAuthOptions } from "@better-auth/core";
 import { createAuthEndpoint } from "@better-auth/core/api";
 import type { User } from "@better-auth/core/db";
 import { APIError, BASE_ERROR_CODES } from "@better-auth/core/error";
+import type { OAuth2Tokens, OAuthProvider } from "@better-auth/core/oauth2";
 import { SocialProviderListEnum } from "@better-auth/core/social-providers";
 import * as z from "zod";
 import { getAwaitableValue } from "../../context/helpers";
@@ -12,6 +13,38 @@ import { handleOAuthUserInfo } from "../../oauth2/link-account";
 import { generateState } from "../../utils";
 import { formCsrfMiddleware } from "../middlewares/origin-check";
 import { createEmailVerificationToken } from "./email-verification";
+
+type AppleNativeProvider = OAuthProvider & {
+	id: "apple";
+	options?: { enableNativeAppleSignInRevocation?: boolean };
+	exchangeNativeAuthorizationCode: (
+		code: string,
+	) => Promise<OAuth2Tokens | null>;
+};
+
+function isAppleNativeProvider(
+	provider: OAuthProvider,
+): provider is AppleNativeProvider {
+	if (provider.id !== "apple") return false;
+	const opts = provider.options as
+		| { enableNativeAppleSignInRevocation?: boolean }
+		| undefined;
+	if (!opts?.enableNativeAppleSignInRevocation) return false;
+	return (
+		"exchangeNativeAuthorizationCode" in provider &&
+		typeof (provider as { exchangeNativeAuthorizationCode?: unknown })
+			.exchangeNativeAuthorizationCode === "function"
+	);
+}
+
+async function exchangeAppleNativeAuthorizationCode(
+	provider: OAuthProvider,
+	code: string | undefined,
+): Promise<OAuth2Tokens | null> {
+	if (!code) return null;
+	if (!isAppleNativeProvider(provider)) return null;
+	return provider.exchangeNativeAuthorizationCode(code);
+}
 
 const socialSignInBodySchema = z.object({
 	/**
@@ -171,6 +204,22 @@ const socialSignInBodySchema = z.object({
 	additionalData: z.record(z.string(), z.any()).optional().meta({
 		description: "Additional data to be passed through the OAuth flow",
 	}),
+	/**
+	 * Authorization code from a native Sign in with Apple credential
+	 * (`ASAuthorizationAppleIDCredential.authorizationCode`). Only honored
+	 * when the Apple provider is configured with
+	 * `enableNativeAppleSignInRevocation: true`. When honored, the server
+	 * exchanges the code with Apple, persists the returned refresh token
+	 * on the account row, and later uses it to revoke the Sign in with
+	 * Apple link when the user is deleted via `/delete-user`.
+	 */
+	appleAuthorizationCode: z
+		.string()
+		.meta({
+			description:
+				"Authorization code from a native Sign in with Apple credential. Apple-specific; honored only when `enableNativeAppleSignInRevocation` is enabled on the Apple provider.",
+		})
+		.optional(),
 });
 
 export const signInSocial = <O extends BetterAuthOptions>() =>
@@ -297,6 +346,13 @@ export const signInSocial = <O extends BetterAuthOptions>() =>
 						BASE_ERROR_CODES.USER_EMAIL_NOT_FOUND,
 					);
 				}
+				// Opt-in: exchange the Apple native authorization code server-side
+				// to obtain a refresh token, persisted on the account row for later
+				// revocation via provider.revokeToken when the user is deleted.
+				const appleNativeTokens = await exchangeAppleNativeAuthorizationCode(
+					provider,
+					c.body.appleAuthorizationCode,
+				);
 				const data = await handleOAuthUserInfo(c, {
 					userInfo: {
 						...userInfo.user,
@@ -309,7 +365,19 @@ export const signInSocial = <O extends BetterAuthOptions>() =>
 					account: {
 						providerId: provider.id,
 						accountId: String(userInfo.user.id),
-						accessToken: c.body.idToken.accessToken,
+						idToken: token,
+						accessToken:
+							appleNativeTokens?.accessToken ?? c.body.idToken.accessToken,
+						refreshToken:
+							appleNativeTokens?.refreshToken ?? c.body.idToken.refreshToken,
+						accessTokenExpiresAt:
+							appleNativeTokens?.accessTokenExpiresAt ??
+							(c.body.idToken.expiresAt
+								? new Date(c.body.idToken.expiresAt * 1000)
+								: undefined),
+						refreshTokenExpiresAt:
+							appleNativeTokens?.refreshTokenExpiresAt ?? undefined,
+						scope: appleNativeTokens?.scopes?.join(",") ?? undefined,
 					},
 					callbackURL: c.body.callbackURL,
 					disableSignUp:

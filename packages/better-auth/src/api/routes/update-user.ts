@@ -1,10 +1,15 @@
-import type { BetterAuthOptions } from "@better-auth/core";
+import type {
+	BetterAuthOptions,
+	GenericEndpointContext,
+} from "@better-auth/core";
 import { createAuthEndpoint } from "@better-auth/core/api";
 import { APIError, BASE_ERROR_CODES } from "@better-auth/core/error";
+import type { OAuthProvider } from "@better-auth/core/oauth2";
 import * as z from "zod";
 import { deleteSessionCookie, setSessionCookie } from "../../cookies";
 import { generateRandomString } from "../../crypto";
 import { parseUserInput, parseUserOutput } from "../../db/schema";
+import { decryptOAuthToken } from "../../oauth2/utils";
 import type { AdditionalUserFieldsInput } from "../../types";
 import { originCheck } from "../middlewares";
 import { createEmailVerificationToken } from "./email-verification";
@@ -13,6 +18,36 @@ import {
 	sensitiveSessionMiddleware,
 	sessionMiddleware,
 } from "./session";
+
+/**
+ * Revoke stored OAuth refresh tokens for any social provider that implements
+ * `revokeToken`. Used during account deletion to sever the link with the
+ * upstream provider (e.g. Apple, per App Store guidelines). Failures are
+ * logged but do not block deletion — the local account must still be removed
+ * even if the upstream revoke is unreachable.
+ */
+async function revokeProviderTokensForUser(
+	ctx: GenericEndpointContext,
+	userId: string,
+) {
+	const accounts = await ctx.context.internalAdapter.findAccounts(userId);
+	for (const account of accounts) {
+		if (!account.refreshToken) continue;
+		const provider = ctx.context.socialProviders.find(
+			(p: OAuthProvider) => p.id === account.providerId,
+		);
+		if (!provider?.revokeToken) continue;
+		try {
+			const token = await decryptOAuthToken(account.refreshToken, ctx.context);
+			await provider.revokeToken(token);
+		} catch (e) {
+			ctx.context.logger.error(
+				`Failed to revoke ${account.providerId} token during user deletion`,
+				e,
+			);
+		}
+	}
+}
 
 const updateUserBodySchema = z.record(
 	z.string().meta({
@@ -548,6 +583,7 @@ export const deleteUser = createAuthEndpoint(
 		if (beforeDelete) {
 			await beforeDelete(session.user, ctx.request);
 		}
+		await revokeProviderTokensForUser(ctx, session.user.id);
 		await ctx.context.internalAdapter.deleteUser(session.user.id);
 		await ctx.context.internalAdapter.deleteSessions(session.user.id);
 		deleteSessionCookie(ctx);
@@ -639,6 +675,7 @@ export const deleteUserCallback = createAuthEndpoint(
 		if (beforeDelete) {
 			await beforeDelete(session.user, ctx.request);
 		}
+		await revokeProviderTokensForUser(ctx, session.user.id);
 		await ctx.context.internalAdapter.deleteUser(session.user.id);
 		await ctx.context.internalAdapter.deleteSessions(session.user.id);
 		await ctx.context.internalAdapter.deleteAccounts(session.user.id);
