@@ -3,9 +3,10 @@ import { betterFetch } from "@better-fetch/fetch";
 import { decodeJwt, decodeProtectedHeader, importJWK, jwtVerify } from "jose";
 import { logger } from "../env";
 import { APIError, BetterAuthError } from "../error";
-import type { OAuthProvider, ProviderOptions } from "../oauth2";
+import type { OAuth2Tokens, OAuthProvider, ProviderOptions } from "../oauth2";
 import {
 	createAuthorizationURL,
+	getOAuth2Tokens,
 	getPrimaryClientId,
 	refreshAccessToken,
 	validateAuthorizationCode,
@@ -75,6 +76,38 @@ export interface AppleOptions extends ProviderOptions<AppleProfile> {
 	clientId: string | string[];
 	appBundleIdentifier?: string | undefined;
 	audience?: (string | string[]) | undefined;
+	/**
+	 * When enabled, `signIn.social` accepts an `appleAuthorizationCode` field
+	 * (from a native iOS/macOS Sign in with Apple credential) and exchanges it
+	 * server-side with Apple for a refresh token. The refresh token is then
+	 * persisted on the account row and used to call Apple's `/auth/revoke`
+	 * endpoint when the user is deleted via `/delete-user`, severing the
+	 * Sign in with Apple link as required by App Store guidelines.
+	 *
+	 * Requires `appBundleIdentifier` to be set, because Apple binds the
+	 * native authorization code to the bundle identifier.
+	 *
+	 * @see https://developer.apple.com/documentation/technotes/tn3194-handling-account-deletions-and-revoking-tokens-for-sign-in-with-apple
+	 * @default false
+	 */
+	enableNativeAppleSignInRevocation?: boolean | undefined;
+}
+
+/**
+ * Apple-specific provider extensions surfaced alongside the standard
+ * {@link OAuthProvider} contract. Cast or narrow via `provider.id === "apple"`
+ * to access these from generic call sites.
+ */
+export interface AppleProviderExtensions {
+	/**
+	 * Exchange an authorization code from a native Sign in with Apple
+	 * credential for OAuth2 tokens. Unlike the web redirect flow, this
+	 * omits `redirect_uri` and uses the configured `appBundleIdentifier`
+	 * as the `client_id`.
+	 */
+	exchangeNativeAuthorizationCode: (
+		code: string,
+	) => Promise<OAuth2Tokens | null>;
 }
 
 async function sha256Hex(value: string) {
@@ -97,7 +130,63 @@ async function nonceMatches(jwtNonce: unknown, nonce: string) {
 
 export const apple = (options: AppleOptions) => {
 	const tokenEndpoint = "https://appleid.apple.com/auth/token";
-	return {
+	const revokeEndpoint = "https://appleid.apple.com/auth/revoke";
+
+	const getNativeClientId = () => {
+		const clientId =
+			options.appBundleIdentifier ?? getPrimaryClientId(options.clientId);
+		if (!clientId) {
+			throw new BetterAuthError("CLIENT_ID_AND_SECRET_REQUIRED");
+		}
+		return clientId;
+	};
+
+	const exchangeNativeAuthorizationCode = async (
+		code: string,
+	): Promise<OAuth2Tokens | null> => {
+		if (!options.clientSecret) {
+			logger.error(
+				"Client secret is required for Apple. Make sure to provide it in the options.",
+			);
+			throw new BetterAuthError("CLIENT_ID_AND_SECRET_REQUIRED");
+		}
+		if (
+			options.enableNativeAppleSignInRevocation &&
+			!options.appBundleIdentifier
+		) {
+			logger.error(
+				"`appBundleIdentifier` is required when `enableNativeAppleSignInRevocation` is enabled.",
+			);
+			throw new BetterAuthError("APPLE_BUNDLE_IDENTIFIER_REQUIRED");
+		}
+		const body = new URLSearchParams();
+		body.set("grant_type", "authorization_code");
+		body.set("code", code);
+		body.set("client_id", getNativeClientId());
+		body.set("client_secret", options.clientSecret);
+		const { data, error } = await betterFetch<Record<string, unknown>>(
+			tokenEndpoint,
+			{
+				method: "POST",
+				body,
+				headers: {
+					"content-type": "application/x-www-form-urlencoded",
+					accept: "application/json",
+				},
+			},
+		);
+		if (error || !data) {
+			throw (
+				error ??
+				new APIError("BAD_REQUEST", {
+					message: "Failed to exchange Apple authorization code",
+				})
+			);
+		}
+		return getOAuth2Tokens(data);
+	};
+
+	const provider = {
 		id: "apple",
 		name: "Apple",
 		async createAuthorizationURL({ state, scopes, redirectURI }) {
@@ -176,6 +265,30 @@ export const apple = (options: AppleOptions) => {
 						tokenEndpoint,
 					});
 				},
+		async revokeToken(token) {
+			if (!options.clientSecret) {
+				logger.error(
+					"Client secret is required for Apple. Make sure to provide it in the options.",
+				);
+				throw new BetterAuthError("CLIENT_ID_AND_SECRET_REQUIRED");
+			}
+			const body = new URLSearchParams();
+			body.set("client_id", getNativeClientId());
+			body.set("client_secret", options.clientSecret);
+			body.set("token", token);
+			body.set("token_type_hint", "refresh_token");
+			const { error } = await betterFetch(revokeEndpoint, {
+				method: "POST",
+				body,
+				headers: {
+					"content-type": "application/x-www-form-urlencoded",
+					accept: "application/json",
+				},
+			});
+			if (error) {
+				throw error;
+			}
+		},
 		async getUserInfo(token) {
 			if (options.getUserInfo) {
 				return options.getUserInfo(token);
@@ -221,6 +334,11 @@ export const apple = (options: AppleOptions) => {
 		},
 		options,
 	} satisfies OAuthProvider<AppleProfile>;
+
+	return {
+		...provider,
+		exchangeNativeAuthorizationCode,
+	} satisfies OAuthProvider<AppleProfile> & AppleProviderExtensions;
 };
 
 export const getApplePublicKey = async (kid: string) => {

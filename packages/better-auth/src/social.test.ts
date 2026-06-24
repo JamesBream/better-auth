@@ -1512,6 +1512,227 @@ describe("Apple Provider", async () => {
 		expect(data.user.email).toBe("noname-user@privaterelay.appleid.com");
 		expect(data.user.name).toBe("");
 	});
+
+	describe("native authorization code + revoke on deletion", () => {
+		const appleProfile = {
+			sub: "001341.example.native",
+			email: "native-user@privaterelay.appleid.com",
+			email_verified: true,
+			is_private_email: true,
+			real_user_status: 2,
+		};
+
+		it("ignores appleAuthorizationCode when enableNativeAppleSignInRevocation is not set", async () => {
+			let exchangeCalled = false;
+			mswServer.use(
+				http.post("https://appleid.apple.com/auth/token", async () => {
+					exchangeCalled = true;
+					return HttpResponse.json({
+						access_token: "should-not-be-used",
+						refresh_token: "should-not-be-used",
+					});
+				}),
+			);
+
+			const idToken = await signJWT(appleProfile, DEFAULT_SECRET);
+			const { client, auth } = await getTestInstance(
+				{
+					socialProviders: {
+						apple: {
+							clientId: "test-apple-client",
+							clientSecret: "test-apple-secret",
+							verifyIdToken: async () => true,
+						},
+					},
+				},
+				{ disableTestUser: true },
+			);
+			const ctx = await auth.$context;
+
+			const res = await client.signIn.social({
+				provider: "apple",
+				idToken: { token: idToken },
+				appleAuthorizationCode: "code-that-should-be-ignored",
+			});
+
+			expect(res.data?.redirect).toBe(false);
+			expect(exchangeCalled).toBe(false);
+			const userId = (res.data as { user: { id: string } }).user.id;
+			const accounts = await ctx.internalAdapter.findAccounts(userId);
+			expect(accounts[0]?.refreshToken).toBeFalsy();
+		});
+
+		it("exchanges appleAuthorizationCode and persists the refresh token when enabled", async () => {
+			let capturedBody: URLSearchParams | null = null;
+			mswServer.use(
+				http.post(
+					"https://appleid.apple.com/auth/token",
+					async ({ request }) => {
+						capturedBody = new URLSearchParams(await request.text());
+						return HttpResponse.json({
+							access_token: "apple-native-access",
+							refresh_token: "apple-native-refresh",
+							token_type: "Bearer",
+							expires_in: 3600,
+						});
+					},
+				),
+			);
+
+			const idToken = await signJWT(appleProfile, DEFAULT_SECRET);
+			const { client, auth } = await getTestInstance(
+				{
+					socialProviders: {
+						apple: {
+							clientId: "test-apple-client",
+							clientSecret: "test-apple-secret",
+							appBundleIdentifier: "com.example.app",
+							enableNativeAppleSignInRevocation: true,
+							verifyIdToken: async () => true,
+						},
+					},
+				},
+				{ disableTestUser: true },
+			);
+			const ctx = await auth.$context;
+
+			const res = await client.signIn.social({
+				provider: "apple",
+				idToken: { token: idToken },
+				appleAuthorizationCode: "native-auth-code",
+			});
+
+			expect(res.data?.redirect).toBe(false);
+			expect(capturedBody).not.toBeNull();
+			expect(capturedBody!.get("grant_type")).toBe("authorization_code");
+			expect(capturedBody!.get("code")).toBe("native-auth-code");
+			expect(capturedBody!.get("client_id")).toBe("com.example.app");
+			expect(capturedBody!.get("client_secret")).toBe("test-apple-secret");
+			expect(capturedBody!.has("redirect_uri")).toBe(false);
+
+			const userId = (res.data as { user: { id: string } }).user.id;
+			const accounts = await ctx.internalAdapter.findAccounts(userId);
+			expect(accounts[0]?.refreshToken).toBe("apple-native-refresh");
+			expect(accounts[0]?.accessToken).toBe("apple-native-access");
+		});
+
+		it("revokes the stored Apple refresh token when the user is deleted", async () => {
+			let capturedRevokeBody: URLSearchParams | null = null;
+			mswServer.use(
+				http.post("https://appleid.apple.com/auth/token", async () =>
+					HttpResponse.json({
+						access_token: "apple-native-access",
+						refresh_token: "apple-native-refresh",
+						token_type: "Bearer",
+						expires_in: 3600,
+					}),
+				),
+				http.post(
+					"https://appleid.apple.com/auth/revoke",
+					async ({ request }) => {
+						capturedRevokeBody = new URLSearchParams(await request.text());
+						return new HttpResponse(null, { status: 200 });
+					},
+				),
+			);
+
+			const idToken = await signJWT(appleProfile, DEFAULT_SECRET);
+			const { client, auth, cookieSetter } = await getTestInstance(
+				{
+					user: { deleteUser: { enabled: true } },
+					socialProviders: {
+						apple: {
+							clientId: "test-apple-client",
+							clientSecret: "test-apple-secret",
+							appBundleIdentifier: "com.example.app",
+							enableNativeAppleSignInRevocation: true,
+							verifyIdToken: async () => true,
+						},
+					},
+				},
+				{ disableTestUser: true },
+			);
+
+			const headers = new Headers();
+			await client.signIn.social({
+				provider: "apple",
+				idToken: { token: idToken },
+				appleAuthorizationCode: "native-auth-code",
+				fetchOptions: { onSuccess: cookieSetter(headers) },
+			});
+
+			const deleteRes = await client.deleteUser({
+				fetchOptions: { headers },
+			});
+			expect(deleteRes.data?.success).toBe(true);
+
+			expect(capturedRevokeBody).not.toBeNull();
+			expect(capturedRevokeBody!.get("token")).toBe("apple-native-refresh");
+			expect(capturedRevokeBody!.get("token_type_hint")).toBe("refresh_token");
+			expect(capturedRevokeBody!.get("client_id")).toBe("com.example.app");
+			expect(capturedRevokeBody!.get("client_secret")).toBe(
+				"test-apple-secret",
+			);
+
+			const ctx = await auth.$context;
+			const user = await ctx.internalAdapter.findUserByEmail(
+				appleProfile.email,
+			);
+			expect(user).toBeNull();
+		});
+
+		it("does not block user deletion when Apple's revoke endpoint fails", async () => {
+			mswServer.use(
+				http.post("https://appleid.apple.com/auth/token", async () =>
+					HttpResponse.json({
+						access_token: "apple-native-access",
+						refresh_token: "apple-native-refresh",
+						token_type: "Bearer",
+						expires_in: 3600,
+					}),
+				),
+				http.post("https://appleid.apple.com/auth/revoke", async () => {
+					return new HttpResponse(null, { status: 500 });
+				}),
+			);
+
+			const idToken = await signJWT(appleProfile, DEFAULT_SECRET);
+			const { client, auth, cookieSetter } = await getTestInstance(
+				{
+					user: { deleteUser: { enabled: true } },
+					socialProviders: {
+						apple: {
+							clientId: "test-apple-client",
+							clientSecret: "test-apple-secret",
+							appBundleIdentifier: "com.example.app",
+							enableNativeAppleSignInRevocation: true,
+							verifyIdToken: async () => true,
+						},
+					},
+				},
+				{ disableTestUser: true },
+			);
+
+			const headers = new Headers();
+			await client.signIn.social({
+				provider: "apple",
+				idToken: { token: idToken },
+				appleAuthorizationCode: "native-auth-code",
+				fetchOptions: { onSuccess: cookieSetter(headers) },
+			});
+
+			const deleteRes = await client.deleteUser({
+				fetchOptions: { headers },
+			});
+			expect(deleteRes.data?.success).toBe(true);
+
+			const ctx = await auth.$context;
+			const user = await ctx.internalAdapter.findUserByEmail(
+				appleProfile.email,
+			);
+			expect(user).toBeNull();
+		});
+	});
 });
 
 describe("Vercel Provider", async () => {
